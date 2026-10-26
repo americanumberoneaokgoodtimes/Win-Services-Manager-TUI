@@ -46,9 +46,7 @@ A fast, interactive, keyboard-driven Windows Services Manager Terminal User Inte
 
 ```text
 Win-Services-Manager-TUI/
-├── win-services-tui3.py       # Main TUI entrypoint & event loop
-├── service_sorter.py          # Modular sorting engine (Name, Running, Startup-type)
-├── service_load.py            # High-speed process telemetry & attribution engine
+├── win-services-tui.py        # All-in-one standalone TUI application
 ├── requirements.txt           # Python dependencies (psutil)
 └── README.md                  # Project documentation & usage guide
 ```
@@ -73,7 +71,7 @@ cd Win-Services-Manager-TUI
 pip install -r requirements.txt
 
 # Run the TUI
-python win-services-tui3.py
+python win-services-tui.py
 ```
 
 ---

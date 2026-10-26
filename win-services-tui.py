@@ -4,12 +4,17 @@ import subprocess
 import msvcrt
 import json
 import ctypes
+import time
+from typing import List, Dict, Any, Optional
+from collections import defaultdict
 
-# Import separate modular features
-from service_sorter import ServiceSorter
-from service_load import ServiceLoadMonitor
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 
-# Enable VT100 ANSI escape sequences in the Windows console
+# Enable VT100 ANSI escape sequences in Windows console
 os.system('')
 
 # Raw ANSI Color Codes
@@ -19,6 +24,211 @@ CYAN = "\033[96m"  # Light Blue
 YELLOW = "\033[93m"
 RESET = "\033[0m"
 INVERT = "\033[7m"
+
+# Windows Priority Class Map
+NICE_MAP = {
+    32: "NORMAL",
+    64: "IDLE",
+    128: "HIGH",
+    256: "REALTIME",
+    16384: "BELOW_NORMAL",
+    32768: "ABOVE_NORMAL",
+}
+
+MODE_ORDER = {
+    "Automatic": 0,
+    "Delayed": 1,
+    "Manual": 2,
+    "Disabled": 3
+}
+
+
+class ServiceSorter:
+    """Handles cycling and sorting of Windows services across different modes."""
+    MODES = ["Name", "Running", "Startup-type"]
+
+    def __init__(self, default_mode: str = "Name"):
+        self.current_mode = default_mode if default_mode in self.MODES else "Name"
+
+    def cycle_mode(self, current_mode: Optional[str] = None) -> str:
+        """Cycles to the next sort mode in sequence: Name -> Running -> Startup-type -> Name"""
+        active = current_mode if current_mode in self.MODES else self.current_mode
+        idx = self.MODES.index(active)
+        next_mode = self.MODES[(idx + 1) % len(self.MODES)]
+        self.current_mode = next_mode
+        return next_mode
+
+    def sort(self, services: List[Dict[str, Any]], mode: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Sorts the service list based on the requested mode:
+        - 'Name': Alphabetical by service name (case-insensitive)
+        - 'Running': Active services first (prioritized by memory footprint descending, then name), followed by stopped
+        - 'Startup-type': Automatic -> Delayed -> Manual -> Disabled, then by name
+        """
+        active_mode = mode if mode in self.MODES else self.current_mode
+        
+        if active_mode == "Running":
+            return sorted(
+                services,
+                key=lambda s: (
+                    0 if s.get("state") == "Running" else 1,
+                    -(s.get("load_rank") or 0.0) if s.get("state") == "Running" else 0.0,
+                    s.get("name", "").lower()
+                )
+            )
+        elif active_mode == "Startup-type":
+            return sorted(
+                services,
+                key=lambda s: (
+                    MODE_ORDER.get(s.get("mode"), 99),
+                    s.get("name", "").lower()
+                )
+            )
+        else:  # "Name" default
+            return sorted(
+                services,
+                key=lambda s: s.get("name", "").lower()
+            )
+
+
+class ServiceLoadMonitor:
+    """
+    Retrieves and tracks real-time system resource metrics for Windows services:
+    - MEM: memory_percent & RSS in MB
+    - CPU: cpu_percent over the last 60 minutes
+    - THREADS: active thread count
+    - IO: cumulative read_bytes + write_bytes
+    - CONNECTIONS: active open sockets
+    - NICE: priority class name
+    """
+    def __init__(self):
+        self._cached_metrics: Dict[str, Dict[str, Any]] = {}
+
+    def fetch_metrics(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Gathers live process resource statistics for running services.
+        Handles shared svchost.exe instances by prorating across hosted services.
+        """
+        if not HAS_PSUTIL:
+            return {}
+
+        now = time.time()
+        pid_to_services: Dict[int, List[str]] = defaultdict(list)
+        svc_to_pid: Dict[str, int] = {}
+
+        for s in psutil.win_service_iter():
+            try:
+                if s.status() == 'running':
+                    pid = s.pid()
+                    if pid:
+                        sname = s.name()
+                        svc_to_pid[sname] = pid
+                        pid_to_services[pid].append(sname)
+            except Exception:
+                pass
+
+        procs: Dict[int, Any] = {}
+        for pid in pid_to_services:
+            try:
+                procs[pid] = psutil.Process(pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
+        metrics: Dict[str, Dict[str, Any]] = {}
+
+        for sname, pid in svc_to_pid.items():
+            p = procs.get(pid)
+            if not p:
+                continue
+
+            shared_count = max(1, len(pid_to_services[pid]))
+
+            # 1. MEM: memory_percent & MB
+            try:
+                raw_rss = p.memory_info().rss
+                mem_mb = (raw_rss / (1024 * 1024)) / shared_count
+                mem_pct = p.memory_percent() / shared_count
+            except Exception:
+                mem_mb = 0.0
+                mem_pct = 0.0
+            mem_str = f"{mem_mb:.1f}" if mem_mb < 10 else f"{int(round(mem_mb))}"
+
+            # 2. CPU: cpu_percent from last 60 minutes
+            try:
+                cpu_sec = (p.cpu_times().user + p.cpu_times().system) / shared_count
+                uptime = max(1.0, now - p.create_time())
+                window_sec = min(3600.0, uptime)
+                cpu_60m = (cpu_sec / window_sec) * 100.0
+            except Exception:
+                cpu_60m = 0.0
+
+            # 3. THREADS: num_threads
+            try:
+                threads = p.num_threads()
+            except Exception:
+                threads = 0
+
+            # 4. IO: read_bytes + write_bytes
+            try:
+                io = p.io_counters()
+                io_bytes = (io.read_bytes + io.write_bytes) // shared_count
+            except Exception:
+                io_bytes = 0
+
+            # 5. CONNECTIONS: len(connections())
+            try:
+                conns = len(p.connections())
+            except Exception:
+                conns = 0
+
+            # 6. NICE: priority class
+            try:
+                nice_val = p.nice()
+                nice_str = NICE_MAP.get(nice_val, str(nice_val))
+            except Exception:
+                nice_str = "NORMAL"
+
+            badge = f"MEM: {mem_str} MB, CPU: (60min) {cpu_60m:.2f}, THREADS: {threads}, IO: {io_bytes}, CONNECTIONS: {conns}, NICE: {nice_str}"
+
+            metrics[sname] = {
+                "pid": pid,
+                "shared_count": shared_count,
+                "mem_mb": mem_mb,
+                "memory_percent": mem_pct,
+                "cpu_60m": cpu_60m,
+                "threads": threads,
+                "io_bytes": io_bytes,
+                "conns": conns,
+                "nice": nice_str,
+                "badge": badge,
+            }
+
+        return metrics
+
+    def get_metrics(self, force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
+        if not self._cached_metrics or force_refresh:
+            self._cached_metrics = self.fetch_metrics()
+        return self._cached_metrics
+
+    def attach_load_to_services(self, services: List[Dict[str, Any]], force_refresh: bool = False) -> None:
+        """Attaches computed resource metrics to each service dictionary in-place."""
+        all_metrics = self.get_metrics(force_refresh=force_refresh)
+        for srv in services:
+            if srv.get("state") == "Running":
+                m = all_metrics.get(srv.get("name", ""))
+                if m:
+                    srv["metrics"] = m
+                    srv["load_rank"] = m["mem_mb"]
+                    srv["metric_badge"] = m["badge"]
+                else:
+                    srv["metrics"] = None
+                    srv["load_rank"] = 0.0
+                    srv["metric_badge"] = "MEM: 0 MB, CPU: (60min) 0.00, THREADS: 0, IO: 0, CONNECTIONS: 0, NICE: NORMAL"
+            else:
+                srv["metrics"] = None
+                srv["load_rank"] = None
+                srv["metric_badge"] = ""
+
 
 class ServicesTUI:
     def __init__(self):
@@ -73,10 +283,10 @@ class ServicesTUI:
                     "dependencies": srv.get("Deps", "")
                 })
 
-            # Feature #2: Attach load impact metrics for all running services
+            # Attach resource telemetry metrics for all running services
             self.load_monitor.attach_load_to_services(self.services, force_refresh=True)
 
-            # Feature #1: Sort list according to current sort mode
+            # Sort list according to current sort mode
             self.apply_sort(cycle=False)
 
         except Exception as e:
@@ -122,7 +332,6 @@ class ServicesTUI:
             cmd = f'sc config "{name}" start= auto'
             
         try:
-            # check_call will throw an exception if the command fails, preventing the UI state from updating falsely
             subprocess.check_call(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             service["mode"] = new_mode
             if self.sort_mode == "Startup-type":
@@ -146,7 +355,9 @@ class ServicesTUI:
             if new_state == "Running":
                 self.load_monitor.attach_load_to_services(self.services, force_refresh=True)
             else:
+                service["metrics"] = None
                 service["load_rank"] = None
+                service["metric_badge"] = ""
                 
             if self.sort_mode == "Running":
                 self.apply_sort(cycle=False)
@@ -214,7 +425,7 @@ class ServicesTUI:
             # Line 1: Name and Description
             sys.stdout.write(f"{prefix}{color}{name_col} {desc_col}{RESET}\n")
             
-            # Line 2: Dependencies and Load Metric
+            # Line 2: Dependencies and Resource Metrics
             # Format: "MEM: 1111 MB, CPU: (60min) 1.11, THREADS: 11, IO: 111111111, CONNECTIONS: 1, NICE: NORMAL"
             dep_content = srv["dependencies"] if srv["dependencies"] else "None"
             if srv["state"] == "Running" and srv.get("metric_badge"):
@@ -246,17 +457,16 @@ class ServicesTUI:
                 
                 if key in (b'\x00', b'\xe0'): 
                     arrow = msvcrt.getch()
-                    if arrow == b'H': # Up
+                    if arrow == b'H':  # Up
                         if self.selected_idx > 0:
                             self.selected_idx -= 1
-                    elif arrow == b'P': # Down
+                    elif arrow == b'P':  # Down
                         if self.selected_idx < len(self.services) - 1:
                             self.selected_idx += 1
                 
                 elif key == b' ': 
                     self.toggle_startup_mode(self.services[self.selected_idx])
                 elif key.lower() == b's': 
-                    # Feature #1: Cycle sort modes
                     self.apply_sort(cycle=True)
                 elif key.lower() == b'r' or key == b'\r': 
                     self.toggle_run_state(self.services[self.selected_idx])
@@ -267,24 +477,19 @@ class ServicesTUI:
                 # Re-render UI after any keystroke
                 self.render()
 
+
 def is_admin():
     """Checks if the script is currently running with Administrator privileges."""
     try:
         return ctypes.windll.shell32.IsUserAnAdmin()
-    except:
+    except Exception:
         return False
+
 
 if __name__ == "__main__":
     if not is_admin():
-        # Re-run the program with admin rights. 
-        # This will trigger the UAC prompt and open a new elevated window.
         print("Administrator privileges required. Requesting elevation...")
-        
-        # We wrap the script path in quotes to handle any spaces in the file path
         script_path = f'"{os.path.abspath(sys.argv[0])}"'
-        
-        # ShellExecuteW parameters: (hwnd, operation, file, parameters, directory, showcmd)
-        # showcmd 1 = SW_NORMAL
         ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, script_path, None, 1)
         sys.exit()
 
