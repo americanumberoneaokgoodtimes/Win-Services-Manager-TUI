@@ -1,0 +1,17 @@
+# Ignore everything by default
+*
+.*
+
+# Whitelist allowed repository files
+!README.md
+!.gitignore
+!win-services-tui3.py
+!win-services-tui-3.py
+!service_sorter.py
+!service_load.py
+!requirements.txt
+
+# Ensure bytecode and caches remain ignored even inside whitelisted patterns
+__pycache__/
+*.pyc
+*.pyo
